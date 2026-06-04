@@ -1,0 +1,163 @@
+# ==========================================
+# 第一步：环境准备 (解决 ModuleNotFoundError)
+# ==========================================
+!pip install python-pptx python-docx lxml Pillow
+
+import os
+import re
+import tempfile
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from docx import Document
+from google.colab import files
+
+# ==========================================
+# 第二步：核心工具函数
+# ==========================================
+
+def clean_text(text):
+    """清洗文本，去除换行符和特殊字符，保持单行"""
+    if not text:
+        return ""
+    # 替换换行符为空格，避免破坏 Markdown 结构
+    text = text.replace("\n", " ").replace("\r", "")
+    # 去除多余空格
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def extract_ppt_to_structured_text(pptx_path, output_txt):
+    """
+    将 PPT 转换为适合大模型的结构化文本
+    格式规范：
+    - 一级标题: # 标题内容
+    - 正文内容: 纯文本
+    - 表格数据: @@ [表头] | [内容] ... @@
+    - 图片占位: ![Image](filename)
+    """
+    if not os.path.exists(pptx_path):
+        print(f"❌ 错误：找不到文件 {pptx_path}")
+        return False
+
+    try:
+        prs = Presentation(pptx_path)
+        last_title = None  # 用于记录上一页标题，实现去重
+        content_blocks = []
+
+        print(f"🚀 正在解析 PPT: {pptx_path} ...")
+
+        for i, slide in enumerate(prs.slides):
+            slide_content = []
+            current_slide_title = None
+
+            # --- 1. 识别当前页标题 ---
+            # 逻辑：优先找 Title 占位符，如果没有，找第一个非空文本框
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    # 判断是否是标题占位符
+                    is_title_placeholder = (
+                        hasattr(shape, "placeholder_format") and
+                        shape.placeholder_format is not None and
+                        shape.placeholder_format.idx == 0  # idx=0 通常是标题
+                    )
+
+                    if is_title_placeholder:
+                        potential_title = clean_text(shape.text)
+                        if potential_title:
+                            current_slide_title = potential_title
+                            break  # 找到标题就停止寻找
+
+            # 如果没找到标准占位符，尝试取第一个有文字的形状作为标题（兜底策略）
+            if not current_slide_title:
+                for shape in slide.shapes:
+                    if shape.has_text_frame and shape.text.strip():
+                        text = clean_text(shape.text)
+                        if len(text) < 50:  # 简单假设短文本是标题
+                            current_slide_title = text
+                            break
+
+            # --- 2. 写入标题 (带去重逻辑) ---
+            if current_slide_title:
+                if current_slide_title != last_title:
+                    slide_content.append(f"# {current_slide_title}")
+                    last_title = current_slide_title
+                # 如果标题相同，则不写入，直接进入正文提取
+
+            # --- 3. 遍历形状提取正文、图片和表格 ---
+            for shape in slide.shapes:
+                # A. 处理图片
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        image_stream = shape.image
+                        ext = image_stream.ext
+                        # 生成唯一文件名
+                        img_name = f"slide_{i+1}_img_{id(shape)}.{ext}"
+
+                        # 保存图片到本地 (Colab 环境)
+                        with open(img_name, "wb") as f:
+                            f.write(image_stream.blob)
+
+                        # 添加 Markdown 图片引用
+                        slide_content.append(f"![Image]({img_name})")
+                    except Exception as e:
+                        print(f"⚠️ 图片提取失败: {e}")
+
+                # B. 处理表格 (使用 @@ 标记)
+                elif shape.has_table:
+                    table_data = []
+                    for row in shape.table.rows:
+                        row_data = [clean_text(cell.text) for cell in row.cells]
+                        table_data.append(" | ".join(row_data))
+
+                    if table_data:
+                        # 将表格行用换行符连接，包裹在 @@ 中
+                        table_str = "\n".join(table_data)
+                        slide_content.append(f"@@\n{table_str}\n@@")
+
+                # C. 处理普通文本 (排除已作为标题处理的形状)
+                elif shape.has_text_frame:
+                    # 简单的过滤逻辑：如果是刚才识别出的标题文本，且内容是标题，则跳过以免重复
+                    text = clean_text(shape.text)
+                    if text and text != current_slide_title:
+                         # 进一步过滤：如果是极短的文本且不是标题，可能是页码或装饰，可选择性忽略
+                         # 这里为了全量，暂时全部保留
+                        slide_content.append(text)
+
+            # 将当前页内容加入总列表，页与页之间加个空行
+            if slide_content:
+                content_blocks.append("\n".join(slide_content))
+
+        # --- 4. 写入文件 ---
+        final_output = "\n\n".join(content_blocks)
+
+        with open(output_txt, "w", encoding="utf-8") as f:
+            f.write(final_output)
+
+        print(f"✅ 转换成功！文件已保存为: {output_txt}")
+        return True
+
+    except Exception as e:
+        import traceback
+        print(f"❌ 发生严重错误: {e}")
+        traceback.print_exc()
+        return False
+
+# ==========================================
+# 第三步：主程序入口
+# ==========================================
+
+if __name__ == "__main__":
+    print("👇 请点击下方按钮上传 PPTX 文件：")
+    uploaded = files.upload()
+
+    if not uploaded:
+        print("⚠️ 未选择文件。")
+    else:
+        input_ppt = list(uploaded.keys())[0]
+        output_name = os.path.splitext(input_ppt)[0] + "_structured.txt"
+
+        success = extract_ppt_to_structured_text(input_ppt, output_name)
+
+        if success:
+            print(f"\n正在自动下载结果文件: {output_name} ...")
+            files.download(output_name)
+            print("\n💡 提示：生成的 .txt 文件可以直接喂给大模型进行 RAG 检索或微调。")
